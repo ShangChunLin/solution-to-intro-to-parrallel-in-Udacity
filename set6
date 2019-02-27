@@ -1,0 +1,422 @@
+//improved with sparse matrix 
+
+//Udacity HW 6
+//Poisson Blending
+
+/* Background
+==========
+The goal for this assignment is to take one image (the source) and
+paste it into another image (the destination) attempting to match the
+two images so that the pasting is non-obvious. This is
+known as a "seamless clone".
+The basic ideas are as follows:
+1) Figure out the interior and border of the source image
+2) Use the values of the border pixels in the destination image
+as boundary conditions for solving a Poisson equation that tells
+us how to blend the images.
+No pixels from the destination except pixels on the border
+are used to compute the match.
+Solving the Poisson Equation
+============================
+There are multiple ways to solve this equation - we choose an iterative
+method - specifically the Jacobi method. Iterative methods start with
+a guess of the solution and then iterate to try and improve the guess
+until it stops changing.  If the problem was well-suited for the method
+then it will stop and where it stops will be the solution.
+The Jacobi method is the simplest iterative method and converges slowly -
+that is we need a lot of iterations to get to the answer, but it is the
+easiest method to write.
+Jacobi Iterations
+=================
+Our initial guess is going to be the source image itself.  This is a pretty
+good guess for what the blended image will look like and it means that
+we won't have to do as many iterations compared to if we had started far
+from the final solution.
+ImageGuess_prev (Floating point)
+ImageGuess_next (Floating point)
+DestinationImg
+SourceImg
+Follow these steps to implement one iteration:
+1) For every pixel p in the interior, compute two sums over the four neighboring pixels:
+Sum1: If the neighbor is in the interior then += ImageGuess_prev[neighbor]
+else if the neighbor in on the border then += DestinationImg[neighbor]
+Sum2: += SourceImg[p] - SourceImg[neighbor]   (for all four neighbors)
+2) Calculate the new pixel value:
+float newVal= (Sum1 + Sum2) / 4.f  <------ Notice that the result is FLOATING POINT
+ImageGuess_next[p] = min(255, max(0, newVal)); //clamp to [0, 255]
+In this assignment we will do 800 iterations.
+*/
+
+
+
+#include "utils.h"
+//#include <thrust/host_vector.h>
+#include <thrust/device_ptr.h>
+#include <thrust/reduce.h>
+#include <thrust/scan.h>
+#include "reference_calc.cpp"
+#include <stdio.h>
+//set_value << <(size + th - 1) / th, th >> >(d_mask, 0, size);
+__global__ void set_value(unsigned int* A, const int B, const int size)
+{
+	int idx = threadIdx.x + blockDim.x*blockIdx.x;
+	if (idx<size)A[idx] = B;
+}
+
+//creat_mask << <(size + th - 1) / th, th >> >(d_mask, d_source, size);
+__global__ void creat_mask(unsigned int* mask,
+	const uchar4* source,
+	unsigned int const size)
+{
+	int idx = threadIdx.x + blockDim.x*blockIdx.x;
+	if (idx >= size)return;
+	//num[0] = 0;
+    __syncthreads();
+    int temp = source[idx].x + source[idx].y + source[idx].z;
+    if (temp< (255 * 3)){mask[idx] = 1;}
+	else mask[idx] = 0;
+}
+//creat_mask_index <<<bs, thread >>>(d_mask, index_x,index_y,numRowsSource, numColsSource);
+// improve wi sparse concept
+//creat_mask_Im <<<(numRowsSource+th-1)/th, th  >>>(d_mask, Im ,numRowsSource, numColsSource);
+__global__ void creat_mask_Im(const unsigned int* mask,unsigned int* Im,unsigned int* first_x,
+                              unsigned int Row,unsigned int Col)
+{
+    int idx = threadIdx.x + blockIdx.x*blockDim.x;
+    if(idx>=Row)return;
+    int count = 0;
+    for(int i=0;i<Col;i++){
+        if(mask[idx*Col+i]){
+            count++;
+//            if(count==1)first_x[idx]=i;
+        }
+    }
+    Im[idx]=count;
+    count=0;
+    for(int i=0;i<Col;i++){
+        if(mask[idx*Col+i]){first_x[idx]=i;return;}
+    }
+}
+//creat_mask_index_x <<<(numColsSource+th-1)/th, th >>>
+//(d_mask, Im ,index_x,numRowsSource, numColsSource,h_num);
+__global__ void creat_mask_index(const unsigned int* mask,unsigned int* Im,unsigned int* first_x,
+                                 unsigned int* index_x,unsigned int* index_y,
+                                 unsigned int Row,unsigned int Col,int num)
+{
+    int idx = threadIdx.x + blockIdx.x*blockDim.x;
+    if(idx>=Row)return;
+    if(Im[idx+1]&&Im[idx]!=num){
+        int idx_num=Im[idx+1]-Im[idx];
+        int count = 0;
+        for(int i=(int)first_x[idx];i<Col;i++){
+            int index = idx*Col+i;
+            if(mask[index]){
+                index_x[Im[idx]+count]=i;
+                index_y[Im[idx]+count]=idx;
+                count++;
+                if(count==idx_num)return;
+            }
+        }
+    }
+}
+
+/*
+__global__ void creat_mask_index(const unsigned int* mask,unsigned int* index_x,
+                                 unsigned int* index_y,unsigned int Row,unsigned int Col,int num)
+{
+	int idx = threadIdx.x + blockIdx.x*blockDim.x;
+    if(idx>=num)return;
+    index_x[idx]=idx;
+    int count = 0;
+    for(int j=0;j<Row;j++){
+        for(int i=0;i<Col;i++){
+            if(mask[j*Col+i])count+=1;
+            if((int)(count-index_x[idx])==1){
+                index_x[idx]=i;
+                index_y[idx]=j;
+                return;
+            }
+        }
+    }
+    
+}
+*/
+//creat_border_restrict << <bs, thread >> >(d_mask, d_border, d_restrict, size, numRowsSource, numColsSource);
+__global__ void creat_border_restrict(const unsigned int* mask,
+	unsigned int* border,
+	unsigned int* Restrict,
+	unsigned int const size,
+	unsigned int const Row,
+	unsigned int const Col
+    )
+{
+    int idx = threadIdx.x + blockIdx.x*blockDim.x;
+	int idy = threadIdx.y + blockIdx.y*blockDim.y;
+	if (idy >= Row || idx >= Col)return;
+    __syncthreads();
+	if (mask[idy*Col + idx])
+	{
+		if (mask[idy*Col + idx + 1] && mask[idy*Col + idx - 1] &&
+            mask[(idy - 1)*Col + idx] && mask[(idy + 1)*Col + idx]){
+			Restrict[idy*Col + idx] = 1;
+		}
+		else border[idy*Col + idx] = 1;
+	}
+}
+
+//first_guess << <(size + th - 1) / th, th >> >(d_red, d_guess, d_iter_r, d_mask, size);
+__global__ void first_guess(const uchar4* source,
+                            float* guess_r,float* guess_g,float* guess_b,
+                            float* iter_r,float* iter_g,float* iter_b,
+                            unsigned int* res, const int  size)
+{
+	int idx = threadIdx.x + blockIdx.x*blockDim.x;
+	if (idx >= size) return;
+	guess_r[idx] = float(source[idx].x);
+    guess_g[idx] = float(source[idx].y);
+    guess_b[idx] = float(source[idx].z);
+	iter_r[idx] = float(source[idx].x);
+    iter_g[idx] = float(source[idx].y);
+    iter_b[idx] = float(source[idx].z);
+}
+
+
+//iter<<<bs,thread>>>(d_iter,d_guess,d_mask,d_border,d_restrict,d_source,d_dest,numRowsSource,numColsSource,size);
+//		iter << <(h_num+th-1)/th, th>> >(d_iter_r,d_iter_g,d_iter_b, d_guess_r,d_guess_g,d_guess_b,
+//                                         d_mask, d_border, d_restrict,
+//                                         d_source, d_dest,index_x,index_y,
+//                                         numRowsSource, numColsSource, size,h_num);
+__global__ void iter(float* iter_r,float* iter_g,float* iter_b,
+                     float* guess_r,float* guess_g,float* guess_b,
+                     unsigned int* mask, unsigned  int* border, unsigned  int* res,
+                     uchar4* source, uchar4* dest,
+                     const unsigned int* const index_x,
+                     const unsigned int* const index_y,
+                     int Row, int Col,
+                     int size,unsigned int const num)
+{
+	int id = threadIdx.x + blockIdx.x*blockDim.x;
+	if (id >= num)return;
+    int idy = index_y[id];
+    int idx = index_x[id];
+	float Sum1 = 0, Sum2 = 0;
+	if (res[idy*Col + idx])
+	{
+		if (res[idy*Col + idx + 1])Sum1 += guess_r[idy*Col + idx + 1];
+		else if (border[idy*Col + idx + 1]) Sum1 += float(dest[idy*Col + idx + 1].x);
+		if (res[idy*Col + idx - 1])Sum1 += guess_r[idy*Col + idx - 1];
+		else if (border[idy*Col + idx - 1]) Sum1 += float(dest[idy*Col + idx - 1].x);
+		if (res[(idy + 1)*Col + idx])Sum1 += guess_r[(idy + 1)*Col + idx];
+		else if (border[(idy + 1)*Col + idx]) Sum1 += float(dest[(idy + 1)*Col + idx].x);
+		if (res[(idy - 1)*Col + idx])Sum1 += guess_r[(idy - 1)*Col + idx];
+		else if (border[(idy - 1)*Col + idx]) Sum1 += float(dest[(idy - 1)*Col + idx].x);
+
+		Sum2 += 4.f*source[idy*Col + idx].x - 
+            float(source[idy*Col + idx + 1].x + source[idy*Col + idx - 1].x 
+                  + source[(idy + 1)*Col + idx].x + source[(idy - 1)*Col + idx].x);
+		float new_val = (Sum1 + Sum2) / 4.f;
+		iter_r[idy*Col + idx] = min(255.f, max(0.f, new_val));
+        
+        Sum1 = 0, Sum2 = 0;
+        if (res[idy*Col + idx + 1])Sum1 += guess_g[idy*Col + idx + 1];
+		else if (border[idy*Col + idx + 1]) Sum1 += float(dest[idy*Col + idx + 1].y);
+		if (res[idy*Col + idx - 1])Sum1 += guess_g[idy*Col + idx - 1];
+		else if (border[idy*Col + idx - 1]) Sum1 += float(dest[idy*Col + idx - 1].y);
+		if (res[(idy + 1)*Col + idx])Sum1 += guess_g[(idy + 1)*Col + idx];
+		else if (border[(idy + 1)*Col + idx]) Sum1 += float(dest[(idy + 1)*Col + idx].y);
+		if (res[(idy - 1)*Col + idx])Sum1 += guess_g[(idy - 1)*Col + idx];
+		else if (border[(idy - 1)*Col + idx]) Sum1 += float(dest[(idy - 1)*Col + idx].y);
+
+		Sum2 += 4.f*source[idy*Col + idx].y - 
+            float(source[idy*Col + idx + 1].y + source[idy*Col + idx - 1].y 
+                  + source[(idy + 1)*Col + idx].y + source[(idy - 1)*Col + idx].y);
+		new_val = (Sum1 + Sum2) / 4.f;
+		iter_g[idy*Col + idx] = min(255.f, max(0.f, new_val));
+            
+        Sum1 = 0, Sum2 = 0;
+        if (res[idy*Col + idx + 1])Sum1 += guess_b[idy*Col + idx + 1];
+		else if (border[idy*Col + idx + 1]) Sum1 += float(dest[idy*Col + idx + 1].z);
+		if (res[idy*Col + idx - 1])Sum1 += guess_b[idy*Col + idx - 1];
+		else if (border[idy*Col + idx - 1]) Sum1 += float(dest[idy*Col + idx - 1].z);
+		if (res[(idy + 1)*Col + idx])Sum1 += guess_b[(idy + 1)*Col + idx];
+		else if (border[(idy + 1)*Col + idx]) Sum1 += float(dest[(idy + 1)*Col + idx].z);
+		if (res[(idy - 1)*Col + idx])Sum1 += guess_b[(idy - 1)*Col + idx];
+		else if (border[(idy - 1)*Col + idx]) Sum1 += float(dest[(idy - 1)*Col + idx].z);
+
+		Sum2 += 4.f*source[idy*Col + idx].z - 
+            float(source[idy*Col + idx + 1].z + source[idy*Col + idx - 1].z 
+                  + source[(idy + 1)*Col + idx].z + source[(idy - 1)*Col + idx].z);
+		new_val = (Sum1 + Sum2) / 4.f;
+		iter_b[idy*Col + idx] = min(255.f, max(0.f, new_val));        
+	}
+	//else printf("Error");
+    //dont copy iter to guess here, cus it needs blocks level sync 
+}
+
+//copy_rgb_t_blend << <(size + th - 1) / th, th >> >(d_blend, d_iter_r, d_iter_g, d_iter_b, size);
+__global__ void copy_rgb_t_blend(uchar4* blend, float* iter_r, float* iter_g, float* iter_b, int size)
+{
+	int idx = threadIdx.x + blockIdx.x*blockDim.x;
+	if (idx >= size) return;
+	//make_uchar4(red, green, blue, 255);
+	unsigned char r = (unsigned char)iter_r[idx];
+	unsigned char g = (unsigned char)iter_g[idx];
+	unsigned char b = (unsigned char)iter_b[idx];
+	blend[idx] = make_uchar4(r, g, b, 255);
+}
+
+
+//copy_itg << <(size + th - 1) / th, th >> >(d_iter, d_guess, size);
+__global__ void copy_itg(float* iter_r,float* iter_g,float* iter_b,
+                         float* guess_r,float* guess_g,float* guess_b,
+                         unsigned int* index_x,unsigned int* index_y, int col,int num)
+{
+	int id = threadIdx.x + blockIdx.x*blockDim.x;
+	if (id >= num)return;
+    int idy = index_y[id];
+    int idx = index_x[id];
+	int index = idy*col+idx;
+	guess_r[index] = iter_r[index];
+    guess_g[index] = iter_g[index];
+    guess_b[index] = iter_b[index];
+}
+//copy_to_dest<<<bs,thread>>>(d_dest,d_mask,d_blend,numRowsSource,numColsSource,size);
+__global__ void copy_to_dest(uchar4* dest, unsigned int* res, uchar4* blend, int Row, int Col, int size)
+{
+	int idx = threadIdx.x + blockIdx.x*blockDim.x;
+	int idy = threadIdx.y + blockIdx.y*blockDim.y;
+	if (idy >= Row || idx >= Col)return;
+	if (res[idy*Col + idx]){
+		dest[idy*Col + idx].x = blend[idy*Col + idx].x;
+		dest[idy*Col + idx].y = blend[idy*Col + idx].y;
+		dest[idy*Col + idx].z = blend[idy*Col + idx].z;
+	}
+}
+
+void your_blend(const uchar4* const h_sourceImg,  //IN
+	const size_t numRowsSource, const size_t numColsSource,
+	const uchar4* const h_destImg, //IN
+	uchar4* const h_blendedImg) //OUT
+{
+	uchar4* d_source, *d_dest, *d_blend;
+	float *d_guess_r,*d_guess_g,*d_guess_b,
+          *d_iter_r, *d_iter_g, *d_iter_b;
+    //can use float3 but it doesn't matter 
+	unsigned int *d_mask, *d_border, *d_restrict;
+    unsigned int size = numRowsSource*numColsSource;
+	cudaMalloc(&d_mask, sizeof(unsigned int)*size);
+	cudaMalloc(&d_border, sizeof(unsigned int)*size);
+	cudaMalloc(&d_restrict, sizeof(unsigned int)*size);
+	//cudaMalloc(&d_buffer, sizeof(uchar4)*size);
+    
+	cudaMalloc(&d_source, sizeof(uchar4)*size);
+    
+	cudaMalloc(&d_dest, sizeof(uchar4)*size);
+	cudaMalloc(&d_blend, sizeof(uchar4)*size);
+	cudaMalloc(&d_guess_r, sizeof(float)*size);
+    cudaMalloc(&d_guess_g, sizeof(float)*size);
+    cudaMalloc(&d_guess_b, sizeof(float)*size);
+	cudaMalloc(&d_iter_r, sizeof(float)*size);
+	cudaMalloc(&d_iter_g, sizeof(float)*size);
+	cudaMalloc(&d_iter_b, sizeof(float)*size);
+	//cudaMemcpy(d_logL_temp,d_logLuminance,sizeof(float)*numCols*numRows,cudaMemcpyDeviceToDevice)
+	cudaMemcpy(d_source, h_sourceImg, sizeof(uchar4)*size, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_dest, h_destImg, sizeof(uchar4)*size, cudaMemcpyHostToDevice);
+	// const dim3 blockSize(NR,NC, 1);
+	int th_x = 128, th_y = 4, th = 256;
+	const dim3 thread(th_x, th_y, 1);
+	const dim3 bs((numColsSource + th_x - 1) / th_x, (numRowsSource + th_y - 1) / th_y, 1);
+    cudaMemset(d_mask,0,sizeof(unsigned int)*size);
+    cudaMemset(d_border,0,sizeof(unsigned int)*size);
+    cudaMemset(d_restrict,0,sizeof(unsigned int)*size);
+    int h_num=0;
+    //cudaMalloc(&d_num,sizeof(int));
+	//cudaMemcpy(d_num,&h_num,sizeof(int),cudaMemcpyHostToDevice);
+    creat_mask << <(size + th - 1) / th, th >> >(d_mask, d_source, size);
+    thrust::device_ptr<unsigned int> d_ptr(d_mask);
+    h_num=thrust::reduce(d_ptr, d_ptr+size);
+    //printf("num = %d\n",h_num);
+    unsigned int * index_x,*index_y;
+    cudaMalloc(&index_x, sizeof(unsigned int)*h_num);
+    cudaMalloc(&index_y, sizeof(unsigned int)*h_num);
+    unsigned int *Im,*first_x;
+    cudaMalloc(&Im, sizeof(unsigned int)*numRowsSource);
+    cudaMalloc(&first_x, sizeof(unsigned int)*numRowsSource);
+    creat_mask_Im <<<(numRowsSource+th-1)/th, th  >>>(d_mask, Im, first_x ,numRowsSource, numColsSource);
+    thrust::device_ptr<unsigned int> d_ptr_2(Im);
+    thrust::exclusive_scan(d_ptr_2, d_ptr_2 + numRowsSource, d_ptr_2);
+    creat_mask_index <<<(numRowsSource+th-1)/th, th >>>(d_mask, Im,first_x ,index_x,index_y,numRowsSource, numColsSource,h_num);
+    creat_border_restrict <<<bs, thread >>>(d_mask, d_border, d_restrict, size, numRowsSource, numColsSource);
+	//seperate <<<(size + th - 1) / th, th>>>(d_source, d_dest, d_buffer, d_mask, size);
+	
+    //star to calculate
+	int iter_num = 800; //# iteration
+	
+    //green start
+	first_guess <<<(size + th - 1) / th, th >>>(d_source, d_guess_r ,d_guess_g, d_guess_b,
+                                                d_iter_r,d_iter_g,d_iter_b, d_mask, size);
+	for (int i = 0; i<iter_num; i++){
+		iter << <(h_num+th-1)/th, th>> >(d_iter_r,d_iter_g,d_iter_b, d_guess_r,d_guess_g,d_guess_b,
+                                         d_mask, d_border, d_restrict,
+                                         d_source, d_dest,index_x,index_y,
+                                         numRowsSource, numColsSource, size,h_num);
+ 		copy_itg <<<(h_num+th-1)/th, th >>>(d_iter_r,d_iter_g,d_iter_b,
+                                            d_guess_r,d_guess_g,d_guess_b,
+                                            index_x,index_y, numColsSource,h_num);
+	}
+	
+	copy_rgb_t_blend << <(size + th - 1) / th, th >> >(d_blend, d_iter_r, d_iter_g, d_iter_b, size);
+	//done
+    
+
+	copy_to_dest <<<bs, thread >>>(d_dest, d_restrict, d_blend, numRowsSource, numColsSource, size);
+
+	cudaMemcpy(h_blendedImg, d_dest, sizeof(uchar4)*size, cudaMemcpyDeviceToHost);
+	
+    //cudaMemcpy(h_blendedImg, d_source, sizeof(uchar4)*size, cudaMemcpyDeviceToHost);
+
+
+
+	//creat_restrict<<<bs,thread>>>(d_mask,d_restrict,size,numRowsSource,numColsSource)
+
+	/* To Recap here are the steps you need to implement
+	1) Compute a mask of the pixels from the source image to be copied
+	The pixels that shouldn't be copied are completely white, they
+	have R=255, G=255, B=255.  Any other pixels SHOULD be copied.
+	2) Compute the interior and border regions of the mask.  An interior
+	pixel has all 4 neighbors also inside the mask.  A border pixel is
+	in the mask itself, but has at least one neighbor that isn't.
+	3) Separate out the incoming image into three separate channels
+	4) Create two float(!) buffers for each color channel that will
+	act as our guesses.  Initialize them to the respective color
+	channel of the source image since that will act as our intial guess.
+	5) For each color channel perform the Jacobi iteration described
+	above 800 times.
+	6) Create the output image by replacing all the interior pixels
+	in the destination image with the result of the Jacobi iterations.
+	cast the floating poJustint values to unsigned chars since we have
+	already made sure to clamp them to the correct range.
+	Since this is final assignment we provide little boilerplate code to
+	help you.  Notice that all the input/output pointers are HOST pointers.
+	You will have to allocate all of your own GPU memory and perform your own
+	memcopies to get data in and out of the GPU memory.
+	Remember to wrap all of your calls with checkCudaErrors() to catch any
+	thing that might go wrong.  After each kernel call do:
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	to catch any errors that happened while executing the kernel.
+	*/
+
+
+
+	/* The reference calculation is provided below, feel free to use it
+	for debugging purposes.
+	*/
+
+	/*
+	uchar4* h_reference = new uchar4[srcSize];
+	reference_calc(h_sourceImg, numRowsSource, numColsSource,
+	h_destImg, h_reference);
+	checkResultsEps((unsigned char *)h_reference, (unsigned char *)h_blendedImg, 4 * srcSize, 2, .01);
+	delete[] h_reference; */
+}
+

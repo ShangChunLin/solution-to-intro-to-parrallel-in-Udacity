@@ -1,0 +1,127 @@
+//Udacity HW 4
+//Radix Sorting
+
+#include "reference_calc.cpp"
+#include "utils.h"
+# define thread 512    
+__global__ void Zero_one (unsigned int* in_vals,int* TF,const int bit,const size_t num,bool zo)
+{
+    int idx=threadIdx.x+blockIdx.x*blockDim.x;
+    if(idx<num)TF[idx]=(((in_vals[idx]>>bit)&1)==zo);
+}
+/*
+__global__ void Zero_one1 (unsigned int* in_vals,int* TF,const int bit,const size_t num)
+{
+    int idx=threadIdx.x+blockIdx.x*blockDim.x;
+    if(idx<num)TF[idx]=(((in_vals[idx]>>bit)&1)==1);
+}*/
+
+__global__ void scan (int* TF,int* in_scan,
+                      const size_t num, const int i )
+{
+    int idx=threadIdx.x+blockIdx.x*blockDim.x;
+    if(idx<int(num))
+    {
+        if( idx >= i ){in_scan[idx]=TF[idx]+TF[idx-i];}
+        else {in_scan[idx]=TF[idx];}
+             __syncthreads();
+    }
+    
+}
+__global__ void StoT(int* TF,int* in_scan,const size_t num)
+{
+    int idx=threadIdx.x+blockIdx.x*blockDim.x;
+    if(idx<num)
+    {TF[idx]=in_scan[idx];
+     __syncthreads();}
+}
+__global__ void sort (unsigned int* inVals,unsigned int* outVals,unsigned int* inPos,unsigned int* outPos,
+                      int* in_scan,unsigned int bit,const size_t num,bool zo)
+{
+    int idx=threadIdx.x+blockIdx.x*blockDim.x;
+    int temp;
+    if(idx<num)
+    {
+        if(zo==0)temp=in_scan[idx]-1;
+        else temp=in_scan[idx]-1+num-in_scan[num-1];
+        if(((inVals[idx]>>bit)&1)==zo)
+        {
+            outVals[temp]=inVals[idx];
+            outPos[temp]=inPos[idx];
+        }
+        __syncthreads();
+    }
+   
+}
+/*
+__global__ void sort1 (unsigned int* inVals,unsigned int* outVals,unsigned int* inPos,unsigned int* outPos,
+                      int* in_scan,unsigned int bit,const size_t num)
+{
+    int idx=threadIdx.x+blockIdx.x*blockDim.x;
+    if(idx<num)
+    {
+        int temp = num-in_scan[num-1];
+        if(((inVals[idx]>>bit)&1)==1)
+        {
+            outVals[in_scan[idx]-1+temp]=inVals[idx];
+            outPos[in_scan[idx]-1+temp]=inPos[idx];
+        }
+        __syncthreads();
+    }
+    
+}
+*/
+__global__ void set (int* array,int val,size_t num)
+{
+    int idx=threadIdx.x+blockIdx.x*blockDim.x;
+    if(idx<int(num)){array[idx]=val;}
+}
+        
+__global__ void copy (unsigned int* inVals,unsigned int* outVals,unsigned int* inPos,unsigned int* outPos,
+                      const size_t num)
+{
+    int idx=threadIdx.x+blockIdx.x*blockDim.x;
+    if(idx<num)
+    {
+        inVals[idx]=outVals[idx];
+        inPos[idx]=outPos[idx];
+    }
+    __syncthreads();
+}
+
+
+void your_sort(unsigned int* const d_inputVals,
+               unsigned int* const d_inputPos,
+               unsigned int* const d_outputVals,
+               unsigned int* const d_outputPos,
+               const size_t numElems)
+{
+    int bs=(numElems+thread-1)/thread;
+    int *TF,*in_scan;;
+    int *h_temp = new int[numElems] ;
+    checkCudaErrors(cudaMalloc(&TF,sizeof(int)*numElems));
+    checkCudaErrors(cudaMalloc(&in_scan,sizeof(int)*numElems));
+    for(int bit=0;bit<32;++bit)
+    {
+        Zero_one<<<bs,thread>>>(d_inputVals,TF,bit,numElems,0);//store 0 or 1 in TF array
+        for(int offset=1;offset<int(numElems);offset<<=1)
+        {
+            scan<<<bs,thread>>>(TF,in_scan,numElems,offset);
+            StoT<<<bs,thread>>>(TF,in_scan,numElems);
+            /* it is worth to know that scan and StoT cant be 
+            in same kernel or launch over 1 block since no way
+            to sync cross block in kernel level*/  
+        }
+        sort<<<bs,thread>>>(d_inputVals,d_outputVals,d_inputPos,d_outputPos,in_scan,bit,numElems,0);//sort zero
+        //sort 1
+        Zero_one<<<bs,thread>>>(d_inputVals,TF,bit,numElems,1);
+        for(int offset=1;offset<int(numElems);offset<<=1)
+        {
+            scan<<<bs,thread>>>(TF,in_scan,numElems,offset);
+            StoT<<<bs,thread>>>(TF,in_scan,numElems);
+        }
+        sort<<<bs,thread>>>(d_inputVals,d_outputVals,d_inputPos,d_outputPos,in_scan,bit,numElems,1);
+        //output->input
+        copy<<<bs,thread>>>(d_inputVals,d_outputVals,d_inputPos,d_outputPos,numElems);
+    }
+}

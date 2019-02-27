@@ -1,0 +1,79 @@
+#include "reference_calc.cpp"
+#include "utils.h"
+ 
+__global__
+void gaussian_blur(const uchar4* const inputChannel,
+                   uchar4* const outputChannel,
+                   int numRows, int numCols,
+                   const float* const filter, const int filterWidth)
+{
+  int absX = blockDim.x * blockIdx.x + threadIdx.x;
+  int absY = blockDim.y * blockIdx.y + threadIdx.y;
+  int absP = absY * numCols + absX;
+  // loop through pixels in filter 
+  extern __shared__ uchar4 data [];
+  uchar4* input_s = (uchar4 *)data;     
+  float *filter_s = (float *) &input_s[(blockDim.x + filterWidth - 1)*(blockDim.y + filterWidth - 1)];
+
+  if (threadIdx.y==0)for(int i = threadIdx.x; i<filterWidth*filterWidth; i+=blockDim.x)filter_s[i]=filter[i];
+  __syncthreads();
+  for(int i = static_cast<int>(-filterWidth/2+threadIdx.x);i<static_cast<int>(filterWidth/2+blockDim.x);i+=static_cast<int>(blockDim.x)){
+      for(int j = static_cast<int>(-filterWidth/2+threadIdx.y);j<static_cast<int>(filterWidth/2+blockDim.y);j+=static_cast<int>(blockDim.y)){
+          int image_r = min(max(static_cast<int>(blockDim.x*blockIdx.x)+i,0), (numCols - 1));
+          int image_c = min(max(static_cast<int>(blockDim.y*blockIdx.y)+j,0), (numRows - 1)); 
+          input_s[(i+filterWidth/2)+(j+filterWidth/2)*(blockDim.x+filterWidth-1)]=inputChannel[image_r+image_c*numCols];
+      }
+  }
+  if(absX>=numCols || absY>=numRows) return;
+  __syncthreads();
+  
+  
+  float blurx=0;
+  float blury=0;
+  float blurz=0;
+  for (int filterX = -filterWidth/2; filterX <= filterWidth/2; filterX++) {
+  for (int filterY = -filterWidth/2; filterY <= filterWidth/2; filterY++) {
+  // check if pixels are in picture..
+      //if (absX + filterX >= 0 && absX + filterX < numCols && absY + filterY >= 0 && absY + filterY < numRows) {
+        // calculate the blurred value and save it
+        int image_r = filterWidth/2+threadIdx.x+filterX;
+        int image_c = filterWidth/2+threadIdx.y+filterY;
+        blurx += (float) filter_s[(filterY +filterWidth/2) * filterWidth + filterX + filterWidth/2] * input_s[image_r+image_c*(blockDim.x+filterWidth-1)].x;
+        blury += (float) filter_s[(filterY +filterWidth/2) * filterWidth + filterX + filterWidth/2] * input_s[image_r+image_c*(blockDim.x+filterWidth-1)].y;
+        blurz += (float) filter_s[(filterY +filterWidth/2) * filterWidth + filterX + filterWidth/2] * input_s[image_r+image_c*(blockDim.x+filterWidth-1)].z;
+        }    
+  }
+    
+  __syncthreads();
+  outputChannel[absP] = make_uchar4(blurx,blury,blurz, 255);
+  
+}
+float         *d_filter;
+
+void allocateMemoryAndCopyToGPU(const size_t numRowsImage, const size_t numColsImage,
+                                const float* const h_filter, const size_t filterWidth){
+  checkCudaErrors(cudaMalloc(&d_filter, sizeof(float) * filterWidth * filterWidth));
+  cudaMemcpy(d_filter,h_filter,sizeof(float) * filterWidth * filterWidth,  cudaMemcpyHostToDevice);
+}
+ 
+void your_gaussian_blur(const uchar4 * const h_inputImageRGBA, uchar4 * const d_inputImageRGBA,
+                        uchar4* const d_outputImageRGBA, const size_t numRows, const size_t numCols,
+                        unsigned char *d_redBlurred, 
+                        unsigned char *d_greenBlurred, 
+                        unsigned char *d_blueBlurred,
+                        const int filterWidth)
+{
+  const dim3 blockSize = dim3(128, 4, 1);
+  const dim3 gridSize = dim3((numCols + blockSize.x-1)/ blockSize.x , (numRows+blockSize.y-1) / blockSize.y , 1);
+  //checkCudaErrors(cudaMalloc(&d_inputImageRGBA,  sizeof(uchar4)*numRows*numCols));
+  cudaMemcpy(d_inputImageRGBA,h_inputImageRGBA,sizeof(uchar4) *numRows * numCols,  cudaMemcpyHostToDevice);
+  gaussian_blur <<< gridSize, blockSize ,filterWidth*filterWidth*sizeof(float)+
+      (blockSize.x+filterWidth-1)*(blockSize.y+filterWidth-1)*sizeof(uchar4)>>> (d_inputImageRGBA, d_outputImageRGBA, numRows, numCols, d_filter, filterWidth);
+  cudaDeviceSynchronize(); 
+  checkCudaErrors(cudaGetLastError()); 
+  cudaDeviceSynchronize(); 
+  checkCudaErrors(cudaGetLastError());
+}
+ 
+
+void cleanup() {}
